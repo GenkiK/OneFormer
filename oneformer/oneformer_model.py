@@ -6,23 +6,27 @@
 from typing import Tuple
 
 import torch
-from torch import nn
-from torch.nn import functional as F
-
 from detectron2.config import configurable
 from detectron2.data import MetadataCatalog
 from detectron2.modeling import META_ARCH_REGISTRY, build_backbone, build_sem_seg_head
 from detectron2.modeling.backbone import Backbone
 from detectron2.modeling.postprocessing import sem_seg_postprocess
-from detectron2.structures import Boxes, ImageList, Instances, BitMasks
+from detectron2.structures import BitMasks, Boxes, ImageList, Instances
+from detectron2.structures.boxes import pairwise_intersection
 from detectron2.utils.memory import retry_if_cuda_oom
+from einops import rearrange
+from mmcv.ops import soft_nms
+from torch import nn
+from torch.nn import functional as F
+from torchvision.ops import masks_to_boxes, nms
+
+from oneformer.data.tokenizer import SimpleTokenizer, Tokenize
 
 from .modeling.criterion import SetCriterion
 from .modeling.matcher import HungarianMatcher
-from einops import rearrange
-from .modeling.transformer_decoder.text_transformer import TextTransformer
 from .modeling.transformer_decoder.oneformer_transformer_decoder import MLP
-from oneformer.data.tokenizer import SimpleTokenizer, Tokenize
+from .modeling.transformer_decoder.text_transformer import TextTransformer
+
 
 @META_ARCH_REGISTRY.register()
 class OneFormer(nn.Module):
@@ -125,12 +129,18 @@ class OneFormer(nn.Module):
         sem_seg_head = build_sem_seg_head(cfg, backbone.output_shape())
 
         if cfg.MODEL.IS_TRAIN:
-            text_encoder = TextTransformer(context_length=cfg.MODEL.TEXT_ENCODER.CONTEXT_LENGTH,
-                                    width=cfg.MODEL.TEXT_ENCODER.WIDTH,
-                                    layers=cfg.MODEL.TEXT_ENCODER.NUM_LAYERS,
-                                    vocab_size=cfg.MODEL.TEXT_ENCODER.VOCAB_SIZE)
-            text_projector = MLP(text_encoder.width, cfg.MODEL.ONE_FORMER.HIDDEN_DIM, 
-                                cfg.MODEL.ONE_FORMER.HIDDEN_DIM, cfg.MODEL.TEXT_ENCODER.PROJ_NUM_LAYERS)
+            text_encoder = TextTransformer(
+                context_length=cfg.MODEL.TEXT_ENCODER.CONTEXT_LENGTH,
+                width=cfg.MODEL.TEXT_ENCODER.WIDTH,
+                layers=cfg.MODEL.TEXT_ENCODER.NUM_LAYERS,
+                vocab_size=cfg.MODEL.TEXT_ENCODER.VOCAB_SIZE,
+            )
+            text_projector = MLP(
+                text_encoder.width,
+                cfg.MODEL.ONE_FORMER.HIDDEN_DIM,
+                cfg.MODEL.ONE_FORMER.HIDDEN_DIM,
+                cfg.MODEL.TEXT_ENCODER.PROJ_NUM_LAYERS,
+            )
             if cfg.MODEL.TEXT_ENCODER.N_CTX > 0:
                 prompt_ctx = nn.Embedding(cfg.MODEL.TEXT_ENCODER.N_CTX, cfg.MODEL.TEXT_ENCODER.WIDTH)
             else:
@@ -140,8 +150,7 @@ class OneFormer(nn.Module):
             text_projector = None
             prompt_ctx = None
 
-        task_mlp = MLP(cfg.INPUT.TASK_SEQ_LEN, cfg.MODEL.ONE_FORMER.HIDDEN_DIM,
-                        cfg.MODEL.ONE_FORMER.HIDDEN_DIM, 2)
+        task_mlp = MLP(cfg.INPUT.TASK_SEQ_LEN, cfg.MODEL.ONE_FORMER.HIDDEN_DIM, cfg.MODEL.ONE_FORMER.HIDDEN_DIM, 2)
 
         # Loss parameters:
         deep_supervision = cfg.MODEL.ONE_FORMER.DEEP_SUPERVISION
@@ -152,7 +161,7 @@ class OneFormer(nn.Module):
         dice_weight = cfg.MODEL.ONE_FORMER.DICE_WEIGHT
         mask_weight = cfg.MODEL.ONE_FORMER.MASK_WEIGHT
         contrastive_weight = cfg.MODEL.ONE_FORMER.CONTRASTIVE_WEIGHT
-        
+
         # building criterion
         matcher = HungarianMatcher(
             cost_class=class_weight,
@@ -161,10 +170,13 @@ class OneFormer(nn.Module):
             num_points=cfg.MODEL.ONE_FORMER.TRAIN_NUM_POINTS,
         )
 
-        weight_dict = {"loss_ce": class_weight, "loss_mask": mask_weight, 
-                        "loss_dice": dice_weight, "loss_contrastive": contrastive_weight}
+        weight_dict = {
+            "loss_ce": class_weight,
+            "loss_mask": mask_weight,
+            "loss_dice": dice_weight,
+            "loss_contrastive": contrastive_weight,
+        }
 
-        
         if deep_supervision:
             dec_layers = cfg.MODEL.ONE_FORMER.DEC_LAYERS
             aux_weight_dict = {}
@@ -228,7 +240,7 @@ class OneFormer(nn.Module):
         num_text = 1
         if text.ndim == 3:
             num_text = text.shape[1]
-            text = rearrange(text, 'b n l -> (b n) l', n=num_text)
+            text = rearrange(text, "b n l -> (b n) l", n=num_text)
             squeeze_dim = True
 
         # [B, C]
@@ -237,13 +249,13 @@ class OneFormer(nn.Module):
         text_x = self.text_projector(x)
 
         if squeeze_dim:
-            text_x = rearrange(text_x, '(b n) c -> b n c', n=num_text)
+            text_x = rearrange(text_x, "(b n) c -> b n c", n=num_text)
             if self.prompt_ctx is not None:
                 text_ctx = self.prompt_ctx.weight.unsqueeze(0).repeat(text_x.shape[0], 1, 1)
                 text_x = torch.cat([text_x, text_ctx], dim=1)
-        
+
         return {"texts": text_x}
-    
+
     def forward(self, batched_inputs):
         """
         Args:
@@ -280,7 +292,9 @@ class OneFormer(nn.Module):
         outputs = self.sem_seg_head(features, tasks)
 
         if self.training:
-            texts = torch.cat([self.text_tokenizer(x["text"]).to(self.device).unsqueeze(0) for x in batched_inputs], dim=0)
+            texts = torch.cat(
+                [self.text_tokenizer(x["text"]).to(self.device).unsqueeze(0) for x in batched_inputs], dim=0
+            )
             texts_x = self.encode_text(texts)
 
             outputs = {**outputs, **texts_x}
@@ -316,9 +330,7 @@ class OneFormer(nn.Module):
             del outputs
 
             processed_results = []
-            for i, data in enumerate(zip(
-                mask_cls_results, mask_pred_results, batched_inputs, images.image_sizes
-            )):
+            for i, data in enumerate(zip(mask_cls_results, mask_pred_results, batched_inputs, images.image_sizes)):
                 mask_cls_result, mask_pred_result, input_per_image, image_size = data
                 height = input_per_image.get("height", image_size[0])
                 width = input_per_image.get("width", image_size[1])
@@ -341,14 +353,18 @@ class OneFormer(nn.Module):
                 if self.panoptic_on:
                     panoptic_r = retry_if_cuda_oom(self.panoptic_inference)(mask_cls_result, mask_pred_result)
                     processed_results[-1]["panoptic_seg"] = panoptic_r
-                
+
                 # instance segmentation inference
                 if self.instance_on:
-                    instance_r = retry_if_cuda_oom(self.instance_inference)(mask_cls_result, mask_pred_result, input_per_image["task"])
+                    instance_r = retry_if_cuda_oom(self.instance_inference)(
+                        mask_cls_result, mask_pred_result, input_per_image["task"]
+                    )
                     processed_results[-1]["instances"] = instance_r
 
                 if self.detection_on:
-                    bbox_r = retry_if_cuda_oom(self.instance_inference)(mask_cls_result, mask_pred_result, input_per_image["task"])
+                    bbox_r = retry_if_cuda_oom(self.instance_inference)(
+                        mask_cls_result, mask_pred_result, input_per_image["task"]
+                    )
                     processed_results[-1]["box_instances"] = bbox_r
 
             return processed_results
@@ -439,8 +455,13 @@ class OneFormer(nn.Module):
 
         # [Q, K]
         scores = F.softmax(mask_cls, dim=-1)[:, :-1]
-        labels = torch.arange(self.sem_seg_head.num_classes, device=self.device).unsqueeze(0).repeat(self.num_queries, 1).flatten(0, 1)
-        
+        labels = (
+            torch.arange(self.sem_seg_head.num_classes, device=self.device)
+            .unsqueeze(0)
+            .repeat(self.num_queries, 1)
+            .flatten(0, 1)
+        )
+
         # scores_per_image, topk_indices = scores.flatten(0, 1).topk(self.num_queries, sorted=False)
         scores_per_image, topk_indices = scores.flatten(0, 1).topk(self.test_topk_per_image, sorted=False)
         labels_per_image = labels[topk_indices]
@@ -465,22 +486,417 @@ class OneFormer(nn.Module):
             scores_per_image = scores_per_image[keep]
             labels_per_image = labels_per_image[keep]
             mask_pred = mask_pred[keep]
-        
-        if 'ade20k' in self.metadata.name and not self.is_demo and "instance" in task_type:
+
+        if "ade20k" in self.metadata.name and not self.is_demo and "instance" in task_type:
             for i in range(labels_per_image.shape[0]):
                 labels_per_image[i] = self.thing_indices.index(labels_per_image[i].item())
 
+        ################## ここから ##############
+        # result = Instances(image_size)
+        # # mask (before sigmoid)
+        # result.pred_masks = (mask_pred > 0).float()
+        # result.pred_boxes = BitMasks(mask_pred > 0).get_bounding_boxes()
+        # # if self.detection_on:
+        # #     # Uncomment the following to get boxes from masks (this is slow)
+        # #     result.pred_boxes = BitMasks(mask_pred > 0).get_bounding_boxes()
+        # # else:
+        # #     result.pred_boxes = Boxes(torch.zeros(mask_pred.size(0), 4))
+
+        # # calculate average mask prob
+        # mask_scores_per_image = (mask_pred.sigmoid().flatten(1) * result.pred_masks.flatten(1)).sum(1) / (
+        #     result.pred_masks.flatten(1).sum(1) + 1e-6
+        # )
+        # result.scores = scores_per_image * mask_scores_per_image
+        # result.pred_classes = labels_per_image
+        # return result
+
+        ########################################
+
+        # result = Instances(image_size)
+        # # mask (before sigmoid)
+        # pred_masks = (mask_pred > 0).float()
+        # pred_boxes = BitMasks(mask_pred > 0).get_bounding_boxes()
+
+        # result.pred_masks, result.pred_boxes = postprocess(pred_masks, pred_boxes)
+        # # if self.detection_on:
+        # #     # Uncomment the following to get boxes from masks (this is slow)
+        # #     result.pred_boxes = BitMasks(mask_pred > 0).get_bounding_boxes()
+        # # else:
+        # #     result.pred_boxes = Boxes(torch.zeros(mask_pred.size(0), 4))
+
+        # # calculate average mask prob
+        # mask_scores_per_image = (mask_pred.sigmoid().flatten(1) * result.pred_masks.flatten(1)).sum(1) / (
+        #     result.pred_masks.flatten(1).sum(1) + 1e-6
+        # )
+        # result.scores = scores_per_image * mask_scores_per_image
+        # result.pred_classes = labels_per_image
+        # print("pred_classes", result.pred_classes)
+        # return result
+
+        #####################################################
+
         result = Instances(image_size)
         # mask (before sigmoid)
-        result.pred_masks = (mask_pred > 0).float()
-        if self.detection_on:
-            # Uncomment the following to get boxes from masks (this is slow)
-            result.pred_boxes = BitMasks(mask_pred > 0).get_bounding_boxes()
-        else:
-            result.pred_boxes = Boxes(torch.zeros(mask_pred.size(0), 4))
+        pred_masks = (mask_pred > 0).float()
+        pred_boxes = BitMasks(mask_pred > 0).get_bounding_boxes()
+
+        background_mask = torch.zeros((1, 256, 832)).to(pred_masks.device)
+        background_label = torch.tensor([-1]).to(labels_per_image.device)
+
+        non_empty_mask_idxs = torch.where(pred_masks.sum(dim=(1, 2)) > 0.0)[0]
+        pred_masks = pred_masks[non_empty_mask_idxs]
+        pred_boxes = pred_boxes[non_empty_mask_idxs]
+        labels_per_image = labels_per_image[non_empty_mask_idxs]
+        mask_pred = mask_pred[non_empty_mask_idxs]
+        scores_per_image = scores_per_image[non_empty_mask_idxs]
+
+        # pred_masks, pred_boxes = postprocess(pred_masks, pred_boxes, labels_per_image)
+        pred_masks, pred_boxes = postprocess_with_moments(pred_masks, pred_boxes, labels_per_image)
+        pred_masks, pred_boxes, pred_classes, mask_pred, scores_per_image = coco_filter_labels(
+            pred_masks, pred_boxes, labels_per_image, mask_pred, scores_per_image
+        )
 
         # calculate average mask prob
-        mask_scores_per_image = (mask_pred.sigmoid().flatten(1) * result.pred_masks.flatten(1)).sum(1) / (result.pred_masks.flatten(1).sum(1) + 1e-6)
-        result.scores = scores_per_image * mask_scores_per_image
-        result.pred_classes = labels_per_image
+        mask_scores_per_image = (mask_pred.sigmoid().flatten(1) * pred_masks.flatten(1)).sum(1) / (
+            pred_masks.flatten(1).sum(1) + 1e-6
+        )
+        scores = scores_per_image * mask_scores_per_image
+
+        ## _, keep = soft_nms(boxes=pred_boxes.tensor, scores=scores.cpu(), iou_threshold=0.3)
+        # keep = nms(boxes=pred_boxes.tensor.to(self.device), scores=scores.to(self.device), iou_threshold=0.5)
+        # keep = keep.long()
+        # result.pred_masks = pred_masks[keep.to(pred_masks.device)]
+        # # result.pred_boxes = pred_boxes[keep.to(pred_boxes.device)]
+        # result.pred_classes = pred_classes[keep.to(pred_classes.device)]
+        # result.scores = scores[keep.to(scores.device)]
+        # return result
+
+        keep = nms(boxes=pred_boxes.tensor.to(self.device), scores=scores.to(self.device), iou_threshold=0.5)
+        keep = keep.long()
+        pred_masks = pred_masks[keep.to(pred_masks.device)]
+        pred_classes = pred_classes[keep.to(pred_classes.device)]
+        if pred_masks.squeeze().shape[0] == 0:
+            result.pred_masks = background_mask
+            result.pred_classes = background_label
+        else:
+            result.pred_masks = torch.cat((background_mask, pred_masks), dim=0)
+            result.pred_classes = torch.cat((background_label, pred_classes), dim=0)
         return result
+
+
+NMS_IOU_THRESHOLD = 0.5
+
+# MIN_MASK_BOX_AREA_RATIO = 0.35
+category2label = {
+    "person": 0,
+    "bicycle": 1,
+    "car": 2,
+    "motorcycle": 3,
+    "bus": 5,
+    "train": 6,
+    "truck": 7,
+    "backpack": 24,
+    "umbrella": 25,
+    "handbag": 26,
+    "tie": 27,
+    "suitcase": 28,
+}
+valid_labels = torch.tensor([0, 1, 2, 3, 5, 6, 7], dtype=torch.long)
+vehicle_labels = torch.tensor([1, 2, 3, 5, 6, 7], dtype=torch.long)
+accessory_labels = torch.tensor([24, 25, 26, 27, 28], dtype=torch.long)
+
+large_vehicle_labels = {2, 5, 6, 7}
+small_vehicle_labels = {1, 3}
+others_labels = {0, 24, 25, 26, 27, 28}
+
+MIN_MASK_PER_BOX_RATIO_DICT = {
+    **{k: 0.4 for k in large_vehicle_labels},
+    **{k: 0.3 for k in small_vehicle_labels},
+    **{k: 0.3 for k in others_labels},
+}
+
+# MAX_CENTER_OFFSETS = {
+#     **{k:  for k in large_vehicle_labels},
+#     **{k: 0.3 for k in small_vehicle_labels},
+#     **{k: 0.3 for k in others_labels},
+# }
+
+
+def calc_moments(masks: torch.Tensor):
+    n, h, w = masks.shape
+    device = masks.device
+    x_weights = masks.sum(dim=1)
+    # assert x_weights.cpu().shape == torch.Size([n, w])
+    m_x = (x_weights @ torch.arange(w, dtype=torch.float32, device=device).view(w, 1)).squeeze() / x_weights.sum(dim=1)
+    y_weights = masks.sum(dim=2)
+    # assert y_weights.cpu().shape == torch.Size([n, h])
+    m_y = (y_weights @ torch.arange(h, dtype=torch.float32, device=device).view(h, 1)).squeeze() / y_weights.sum(dim=1)
+    return torch.stack((m_x, m_y), dim=1)  # [[x1, y1], [x2, y2], ...]
+
+
+MAX_CENTER_OFFSET = 0.15
+
+
+def postprocess_with_moments(masks: torch.Tensor, boxes: Boxes, labels: torch.Tensor) -> Tuple[torch.Tensor, Boxes]:
+    box_device = boxes.device
+    boxes = boxes.to(masks.device)
+    box_sizes = torch.stack(
+        (
+            boxes.tensor[:, 2] - boxes.tensor[:, 0],
+            boxes.tensor[:, 3] - boxes.tensor[:, 1],
+        ),
+        dim=1,
+    )
+    x_y_offsets = box_sizes * MAX_CENTER_OFFSET
+    moments = calc_moments(masks)
+    centers = boxes.get_centers()
+    center_moment_diffs = (centers - moments).int()
+    # idxs = torch.where(
+    #     (
+    #         (moments[:, 0] < centers[:, 0] - x_y_offsets[:, 0])
+    #         | (moments[:, 1] < centers[:, 1] - x_y_offsets[:, 1])
+    #         | (moments[:, 0] > centers[:, 0] + x_y_offsets[:, 0])
+    #         | (moments[:, 1] > centers[:, 1] + x_y_offsets[:, 1])
+    #     )
+    #     & (labels != category2label["bicycle"])
+    # )[0]
+    idxs = torch.where(
+        (moments[:, 0] < centers[:, 0] - x_y_offsets[:, 0])
+        | (moments[:, 1] < centers[:, 1] - x_y_offsets[:, 1])
+        | (moments[:, 0] > centers[:, 0] + x_y_offsets[:, 0])
+        | (moments[:, 1] > centers[:, 1] + x_y_offsets[:, 1])
+    )[0]
+    # moment(重心)を新たな中心として元のboxサイズ分でマスクをクロップ（ゼロ埋め）
+    for idx in idxs:
+        box_w, box_h = box_sizes[idx]
+        # momentを中心としたBBoxの2点
+        x1, y1, x2, y2 = boxes.tensor[idx].int() - center_moment_diffs[idx].repeat(2)
+        # HACK: y方向のモーメントは考えなくていいかも
+        y1 -= (box_h * 0.1).int()
+        y2 += (box_h * 0.1).int()
+        x1 += (box_w * 0.1).int()
+        x2 -= (box_w * 0.1).int()
+        masks[idx, : max(y1.item(), 0), :] = 0.0
+        masks[idx, :, : max(x1.item(), 0)] = 0.0
+        masks[idx, y2:, :] = 0.0
+        masks[idx, :, x2:] = 0.0
+    boxes.tensor[idxs] = masks_to_boxes(masks[idxs])
+
+    # マスク領域面積/ボックス面積が小さいもののidx
+    mask_areas = masks.sum(dim=(1, 2))
+
+    MIN_RATIO = 0.3
+    idxs = torch.where(mask_areas / boxes.area() < MIN_RATIO)[0]
+    for idx in idxs:
+        x1, y1, x2, y2 = boxes.tensor[idx].int()
+        box_w_fourth = torch.div((x2 - x1 + 1), 4, rounding_mode="trunc")
+        mask_box_left = masks[idx, y1 : y2 + 1, x1 : x2 + 1][:, :box_w_fourth].sum()
+        mask_box_right = masks[idx, y1 : y2 + 1, x1 : x2 + 1][:, box_w_fourth:].sum()
+        if mask_box_left < mask_box_right:
+            masks[idx, y1 : y2 + 1, x1 : x2 + 1][:, :box_w_fourth] = 0.0
+        else:
+            masks[idx, y1 : y2 + 1, x1 : x2 + 1][:, 2 * box_w_fourth :] = 0.0
+    boxes.tensor[idxs] = masks_to_boxes(masks[idxs])
+    return masks, boxes.to(box_device)
+
+
+def postprocess(masks: torch.Tensor, boxes: Boxes, labels: torch.Tensor) -> Tuple[torch.Tensor, Boxes]:
+    box_device = boxes.device
+    boxes = boxes.to(masks.device)
+    mask_areas = masks.sum(dim=(1, 2))
+    # マスク領域面積/ボックス面積が小さいもののINDEX
+
+    min_ratio = torch.tensor(
+        [
+            MIN_MASK_PER_BOX_RATIO_DICT[label.item()] if label.item() in MIN_MASK_PER_BOX_RATIO_DICT else 0
+            for label in labels.cpu()
+        ]
+    ).to(masks.device)
+    idxs = torch.where(mask_areas / boxes.area() < min_ratio)[0]
+    for idx in idxs:
+        x1, y1, x2, y2 = boxes.tensor[idx].int()
+        box_w_fourth = torch.div((x2 - x1 + 1), 4, rounding_mode="trunc")
+        mask_box_left = masks[idx, y1 : y2 + 1, x1 : x2 + 1][:, :box_w_fourth].sum()
+        mask_box_right = masks[idx, y1 : y2 + 1, x1 : x2 + 1][:, box_w_fourth:].sum()
+        if mask_box_left < mask_box_right:
+            masks[idx, y1 : y2 + 1, x1 : x2 + 1][:, :box_w_fourth] = 0.0
+        else:
+            masks[idx, y1 : y2 + 1, x1 : x2 + 1][:, 2 * box_w_fourth :] = 0.0
+    boxes.tensor[idxs] = masks_to_boxes(masks[idxs])
+    return masks, boxes.to(box_device)
+
+
+def coco_filter_labels(
+    masks: torch.Tensor, boxes: Boxes, labels: torch.Tensor, mask_pred: torch.Tensor, scores_per_image: torch.Tensor
+) -> Tuple[torch.Tensor, Boxes, torch.Tensor]:
+    # accessory のみを退避
+    global category2label
+    global accessory_labels
+    global valid_labels
+    global vehicle_labels
+
+    accessory_idxs = torch.tensor(
+        [idx for idx, label in enumerate(labels) if label in accessory_labels.to(labels.device)], dtype=torch.long
+    )
+    accessory_masks = masks[accessory_idxs.to(masks.device)]
+    accessory_boxes = boxes[accessory_idxs.to(boxes.device)]
+    accessory_mask_pred = mask_pred[accessory_idxs.to(labels.device)]
+
+    # valid_label のみに絞り込む
+    keep_idxs = torch.tensor(
+        [idx for idx, label in enumerate(labels) if label in valid_labels.to(labels.device)], dtype=torch.long
+    )
+    masks = masks[keep_idxs.to(masks.device)]
+    boxes = boxes[keep_idxs.to(boxes.device)]
+    labels = labels[keep_idxs.to(labels.device)]
+    mask_pred = mask_pred[keep_idxs.to(mask_pred.device)]
+    scores_per_image = scores_per_image[keep_idxs.to(scores_per_image.device)]
+
+    # HACK: 既にmasksなどはkeep_idxsで絞らているので，これ以降keep_idxsは使用してはいけない．
+
+    # accessoryを身に着けている人のインスタンスに合体させる.personのbboxに囲われた部分が一番大きいperson maskに合体．IOUを計算
+    person_label = category2label["person"]
+    person_idxs = torch.where(labels == person_label)[0]
+    intersections = pairwise_intersection(accessory_boxes, boxes[person_idxs])
+    # FIXME: ベンチの上に置かれたバックなどは考慮できてない
+    # 交差面積が0のアクセサリーが存在する時に，0番目のpersonに勝手にアクセサリーがマージされないようブラフのカラムを作る
+    intersections = torch.cat((torch.zeros((intersections.shape[0], 1)), intersections), dim=1)
+    # 各アクセサリーごとにintersectionが最大値を取るpersonのidxを計算
+    person_idxs_idxs = intersections.argmax(dim=1) - 1  # ブラフカラム分のインデックスを引く
+    person_idxs_idxs = person_idxs_idxs[person_idxs_idxs >= 0]
+    if len(person_idxs_idxs):
+        # masks[person_idxs[person_idxs_idxs]] = torch.logical_or(
+        #     masks[person_idxs[person_idxs_idxs]],
+        #     accessory_masks.to(masks.device),
+        #     out=torch.empty_like(masks[person_idxs[person_idxs_idxs]]),
+        # )
+        # person_idxs_idxsに複数同じインデックスが入った時にlogical_orの代入が正しく処理されないのでループで回す
+        for i in range(person_idxs_idxs.shape[0]):
+            masks[person_idxs[person_idxs_idxs[i]]] = torch.logical_or(
+                masks[person_idxs[person_idxs_idxs[i]]],
+                accessory_masks[i, :, :],
+                out=torch.empty_like(masks[person_idxs[person_idxs_idxs[i]]]),
+            )
+            # HACK: 単純にmask_predは足し合わせていいのか？
+            mask_pred[person_idxs[person_idxs_idxs[i]]] += accessory_mask_pred.to(mask_pred.device)[i]
+        boxes.tensor[person_idxs[person_idxs_idxs]] = masks_to_boxes(masks[person_idxs[person_idxs_idxs]]).to(
+            boxes.device
+        )
+
+    # vehicleに乗っている人をvehicleインスタンスに合体させる.縮小させたvehicleのbboxに人が含まれているかどうかを見る
+    # -> もしかして搭乗者部分も車のマスクはかかってる？一旦合体させず人だけ消して見てみる．
+    vehicle_idxs = torch.tensor(
+        [idx for idx, label in enumerate(labels) if label in vehicle_labels.to(labels.device)], dtype=torch.long
+    )
+    if len(vehicle_idxs):
+        vehicle_boxes_tensor = boxes.tensor[vehicle_idxs]
+        assert len(vehicle_boxes_tensor.shape) == 2
+        # BBOXのwidth, heightの10%分
+        # vehicle_w_h_shrunk_offset = (
+        #     torch.stack(
+        #         (
+        #             vehicle_boxes_tensor[:, 2] - vehicle_boxes_tensor[:, 0],
+        #             vehicle_boxes_tensor[:, 3] - vehicle_boxes_tensor[:, 1],
+        #         ),
+        #         dim=1,
+        #     )
+        #     * 0.05
+        # )
+        # vehicle_shrunk_boxes_tensor = torch.stack(
+        #     (
+        #         vehicle_boxes_tensor[:, 0] + vehicle_w_h_shrunk_offset[:, 0],
+        #         vehicle_boxes_tensor[:, 1] + vehicle_w_h_shrunk_offset[:, 1],
+        #         vehicle_boxes_tensor[:, 2] - vehicle_w_h_shrunk_offset[:, 0],
+        #         vehicle_boxes_tensor[:, 3] - vehicle_w_h_shrunk_offset[:, 1],
+        #     ),
+        #     dim=1,
+        # )
+
+        # # vehicleの左右10%のみを縮小する
+        # vehicle_w_shrunk_offset = (vehicle_boxes_tensor[:, 2] - vehicle_boxes_tensor[:, 0]) * 0.1
+        # vehicle_shrunk_boxes_tensor = torch.stack(
+        #     (
+        #         vehicle_boxes_tensor[:, 0] + vehicle_w_shrunk_offset[0],
+        #         vehicle_boxes_tensor[:, 1],
+        #         vehicle_boxes_tensor[:, 2] - vehicle_w_shrunk_offset[0],
+        #         vehicle_boxes_tensor[:, 3],
+        #     ),
+        #     dim=1,
+        # )
+        # 車のBBoxに囲まれたpersonを車に統合
+        # vehicle_x_person_idx_idxs = inside_boxes_idxs(vehicle_shrunk_boxes_tensor, boxes.tensor[person_idxs])
+        vehicle_x_person_idx_idxs = inside_boxes_idxs(vehicle_boxes_tensor, boxes.tensor[person_idxs])
+        # 同じ車内に複数人検出した時にダメになる？
+        if len(vehicle_x_person_idx_idxs[0]):
+            # ↓これは多分無くてもいい．元々搭乗者部分にも車マスクはついてある．
+            for i in range(len(vehicle_x_person_idx_idxs[0])):
+                masks[vehicle_idxs[vehicle_x_person_idx_idxs[0][i]]] = torch.logical_or(
+                    masks[vehicle_idxs[vehicle_x_person_idx_idxs[0][i]]],
+                    masks[person_idxs[vehicle_x_person_idx_idxs[1][i]]],
+                    out=torch.empty_like(masks[vehicle_idxs[vehicle_x_person_idx_idxs[0][i]]]),
+                )
+            # mask, boxes, labelから統合されたpersonを消す
+            # keep_idxs = torch.tensor([idx for idx in keep_idxs if idx not in person_idxs[vehicle_x_person_idxs[1]].to(labels.device)], dtype=torch.long)
+            # HACK: ↑これではなぜかエラーが出るので，めんどくさい方法でやってる
+            remove_person_idxs = person_idxs[vehicle_x_person_idx_idxs[1]].to(keep_idxs.device)
+            keep_idxs = (
+                torch.nonzero((torch.arange(labels.shape[0])[:, None] - remove_person_idxs[None, :]).prod(dim=1))
+                .transpose(0, 1)
+                .squeeze(0)
+            )
+            masks = masks[keep_idxs.to(masks.device)]
+            boxes = boxes[keep_idxs.to(boxes.device)]
+            labels = labels[keep_idxs.to(labels.device)]
+            mask_pred = mask_pred[keep_idxs.to(mask_pred.device)]
+            scores_per_image = scores_per_image[keep_idxs.to(scores_per_image.device)]
+    return masks, boxes, labels, mask_pred, scores_per_image
+
+
+# large_boxesとsmall_boxesの個数が違うことや，１つの車に複数の人が含まれるかもしれないことを考えてない．pairwise_intersectionに学ぶ．
+def inside_boxes_idxs(large_boxes: torch.Tensor, small_boxes: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    large_x_small_idxs = torch.where(
+        (large_boxes[:, None, 0] <= small_boxes[:, 0])
+        & (large_boxes[:, None, 1] <= small_boxes[:, 1])
+        & (large_boxes[:, None, 2] >= small_boxes[:, 2])
+        & (large_boxes[:, None, 3] >= small_boxes[:, 3])
+    )  # 真理値からなるlen(large_boxes) x len(small_boxes) の行列のidx
+    return large_x_small_idxs
+
+
+# def postprocess(masks: torch.Tensor, boxes: Boxes) -> Tuple[torch.Tensor, Boxes]:
+#     mask_device = masks.device
+#     box_device = boxes.device
+#     boxes = boxes.to(mask_device)
+#     mask_areas = masks.sum(dim=(1, 2))
+#     # マスク領域面積/ボックス面積が小さいもののINDEX
+#     idxs = torch.where(mask_areas / boxes.area() < MIN_MASK_BOX_AREA_RATIO)[0]
+#     x1, y1, x2, y2 = boxes.tensor[idxs].int().T
+#     box_w_thirds = torch.div(x2 - x1 + 1, 3, rounding_mode="trunc")
+#     mask_box_left = masks[idxs, y1 : y2 + 1, x1 : x2 + 1][:, :, :box_w_thirds].sum(dim=(1, 2))
+#     mask_box_right = masks[idxs, y1 : y2 + 1, x1 : x2 + 1][:, :, box_w_thirds:].sum(dim=(1, 2))
+#     left_small_idxs = torch.where(mask_box_left < mask_box_right)[0].int()
+#     right_small_idxs = torch.where(mask_box_left >= mask_box_right)[0].int()
+#     masks[left_small_idxs, y1 : y2 + 1, x1 : x2 + 1][:, :, :box_w_thirds] = 0.0
+#     masks[right_small_idxs, y1 : y2 + 1, x1 : x2 + 1][:, :, 2 * box_w_thirds :] = 0.0
+#     boxes.tensor[idxs] = masks_to_boxes(masks[idxs])
+#     return masks, boxes.to(box_device)
+
+
+# def postprocess(masks: torch.Tensor, boxes: Boxes) -> Tuple[torch.Tensor, Boxes]:
+#     mask_device = masks.device  # cuda
+#     box_device = boxes.device  # cpu
+#     boxes = boxes.to(mask_device)
+#     mask_areas = masks.sum(dim=(1, 2))  # cuda
+#     # マスク領域面積/ボックス面積が小さいもののINDEX
+#     idxs = torch.where(mask_areas / boxes.area() < MIN_MASK_BOX_AREA_RATIO)[0]
+#     _, h, w = masks.shape
+#     left_masks_area = masks[idxs, :, : w // 3].sum(dim=(1, 2))
+#     right_masks_area = masks[idxs, :, 2 * w // 3 :].sum(dim=(1, 2))
+#     left_small_idxs = torch.where(left_masks_area < right_masks_area)[0]
+#     right_small_idxs = torch.where(left_masks_area >= right_masks_area)[0]
+#     masks[idxs[left_small_idxs], :, : w // 3] = torch.zeros((len(left_small_idxs), h, w // 3), device=mask_device)
+#     masks[idxs[right_small_idxs], :, 2 * w // 3 :] = torch.zeros(
+#         (len(right_small_idxs), h, w - 2 * w // 3), device=mask_device
+#     )
+#     boxes.tensor[idxs] = masks_to_boxes(masks[idxs])
+#     return masks, boxes.to(box_device)

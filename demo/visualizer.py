@@ -6,23 +6,25 @@
 import colorsys
 import logging
 import math
-import numpy as np
+import random
 from enum import Enum, unique
+
 import cv2
 import matplotlib as mpl
 import matplotlib.colors as mplc
 import matplotlib.figure as mplfigure
+import numpy as np
 import pycocotools.mask as mask_util
 import torch
-from matplotlib.backends.backend_agg import FigureCanvasAgg
-from PIL import Image
-
 from detectron2.data import MetadataCatalog
 from detectron2.structures import BitMasks, Boxes, BoxMode, Keypoints, PolygonMasks, RotatedBoxes
 from detectron2.utils.file_io import PathManager
-import random
+from matplotlib.backends.backend_agg import FigureCanvasAgg
+from PIL import Image
+
 random.seed(0)
-from colormap import random_color, _COLORS
+from colormap import _COLORS, random_color
+
 logger = logging.getLogger(__name__)
 
 __all__ = ["ColorMode", "VisImage", "Visualizer"]
@@ -49,6 +51,7 @@ def instance_color(rgb=False, idx=1, maximum=255):
     if not rgb:
         ret = ret[::-1]
     return ret
+
 
 @unique
 class ColorMode(Enum):
@@ -221,9 +224,7 @@ class _PanopticPrediction:
                 empty_ids.append(id)
         if len(empty_ids) == 0:
             return np.zeros(self._seg.shape, dtype=np.uint8)
-        assert (
-            len(empty_ids) == 1
-        ), ">1 ids corresponds to no labels. This is currently not supported"
+        assert len(empty_ids) == 1, ">1 ids corresponds to no labels. This is currently not supported"
         return (self._seg != empty_ids[0]).numpy().astype(np.bool)
 
     def semantic_masks(self):
@@ -385,23 +386,15 @@ class Visualizer:
         self.cpu_device = torch.device("cpu")
 
         # too small texts are useless, therefore clamp to 9
-        self._default_font_size = max(
-            np.sqrt(self.output.height * self.output.width) // 90, 10 // scale
-        )
+        self._default_font_size = max(np.sqrt(self.output.height * self.output.width) // 90, 10 // scale)
         self._instance_mode = instance_mode
         self.keypoint_threshold = _KEYPOINT_THRESHOLD
 
     def get_image(self, img):
         img = np.asarray(img).clip(0, 255).astype(np.uint8)
         return VisImage(img, scale=1.0)
-    
-    def draw_box_predictions(
-        self,
-        boxes=None,
-        labels=None,
-        scores=None,
-        assigned_colors=None
-    ):
+
+    def draw_box_predictions(self, boxes=None, labels=None, scores=None, assigned_colors=None):
         """
         Args:
             boxes (Boxes, RotatedBoxes or ndarray): either a :class:`Boxes`,
@@ -455,10 +448,7 @@ class Visualizer:
                     continue  # drawing the box confidence for keypoints isn't very useful.
                 # for small objects, draw text at the side to avoid occlusion
                 instance_area = (y1 - y0) * (x1 - x0)
-                if (
-                    instance_area < _SMALL_OBJECT_AREA_THRESH * self.output.scale
-                    or y1 - y0 < 40 * self.output.scale
-                ):
+                if instance_area < _SMALL_OBJECT_AREA_THRESH * self.output.scale or y1 - y0 < 40 * self.output.scale:
                     if y1 >= self.output.height - 5:
                         text_pos = (x1, y0)
                     else:
@@ -466,11 +456,7 @@ class Visualizer:
 
                 height_ratio = (y1 - y0) / np.sqrt(self.output.height * self.output.width)
                 lighter_color = self._change_color_brightness(color, brightness_factor=0.7)
-                font_size = (
-                    np.clip((height_ratio - 0.02) / 0.08 + 1, 1.2, 2)
-                    * 0.5
-                    * self._default_font_size
-                )
+                font_size = np.clip((height_ratio - 0.02) / 0.08 + 1, 1.2, 2) * 0.5 * self._default_font_size
                 self.draw_text(
                     labels[i],
                     text_pos,
@@ -480,8 +466,7 @@ class Visualizer:
                 )
 
         return self.output
-    
-    
+
     def draw_instance_predictions(self, predictions, alpha=0.8):
         """
         Draw instance-level prediction results on an image.
@@ -508,18 +493,14 @@ class Visualizer:
             # colors = [
             #     self._jitter([x / 255 for x in self.metadata.thing_colors[c]]) for c in classes
             # ]
-            colors = [
-                instance_color(rgb=True, idx=c, maximum=1) for c in classes
-            ]
+            colors = [instance_color(rgb=True, idx=c, maximum=1) for c in classes]
         else:
             colors = None
 
         if self._instance_mode == ColorMode.IMAGE_BW:
             self.output.reset_image(
                 self._create_grayscale_image(
-                    (predictions.pred_masks.any(dim=0) > 0).numpy()
-                    if predictions.has("pred_masks")
-                    else None
+                    (predictions.pred_masks.any(dim=0) > 0).numpy() if predictions.has("pred_masks") else None
                 )
             )
 
@@ -620,9 +601,7 @@ class Visualizer:
         )
 
         try:
-            colors = [
-                self._jitter([x / 255 for x in self.metadata.stuff_colors[c]]) for c in category_ids
-            ]
+            colors = [self._jitter([x / 255 for x in self.metadata.stuff_colors[c]]) for c in category_ids]
         except AttributeError:
             colors = None
         self.overlay_instances(masks=masks, labels=labels, assigned_colors=colors, alpha=alpha)
@@ -652,19 +631,14 @@ class Visualizer:
                 keypts = None
 
             boxes = [
-                BoxMode.convert(x["bbox"], x["bbox_mode"], BoxMode.XYXY_ABS)
-                if len(x["bbox"]) == 4
-                else x["bbox"]
+                BoxMode.convert(x["bbox"], x["bbox_mode"], BoxMode.XYXY_ABS) if len(x["bbox"]) == 4 else x["bbox"]
                 for x in annos
             ]
 
             colors = None
             category_ids = [x["category_id"] for x in annos]
             if self._instance_mode == ColorMode.SEGMENTATION and self.metadata.get("stuff_colors"):
-                colors = [
-                    self._jitter([x / 255 for x in self.metadata.stuff_colors[c]])
-                    for c in category_ids
-                ]
+                colors = [self._jitter([x / 255 for x in self.metadata.stuff_colors[c]]) for c in category_ids]
             names = self.metadata.get("stuff_classes", None)
             labels = _create_text_labels(
                 category_ids,
@@ -672,9 +646,7 @@ class Visualizer:
                 class_names=names,
                 is_crowd=[x.get("iscrowd", 0) for x in annos],
             )
-            self.overlay_instances(
-                labels=labels, boxes=boxes, masks=masks, keypoints=keypts, assigned_colors=colors
-            )
+            self.overlay_instances(labels=labels, boxes=boxes, masks=masks, keypoints=keypts, assigned_colors=colors)
 
         sem_seg = dic.get("sem_seg", None)
         if sem_seg is None and "sem_seg_file_name" in dic:
@@ -759,9 +731,7 @@ class Visualizer:
         if num_instances == 0:
             return self.output
         if boxes is not None and boxes.shape[1] == 5:
-            return self.overlay_rotated_instances(
-                boxes=boxes, labels=labels, assigned_colors=assigned_colors
-            )
+            return self.overlay_rotated_instances(boxes=boxes, labels=labels, assigned_colors=assigned_colors)
 
         # Display in largest to smallest order to reduce occlusion.
         areas = None
@@ -809,10 +779,7 @@ class Visualizer:
                     continue  # drawing the box confidence for keypoints isn't very useful.
                 # for small objects, draw text at the side to avoid occlusion
                 instance_area = (y1 - y0) * (x1 - x0)
-                if (
-                    instance_area < _SMALL_OBJECT_AREA_THRESH * self.output.scale
-                    or y1 - y0 < 40 * self.output.scale
-                ):
+                if instance_area < _SMALL_OBJECT_AREA_THRESH * self.output.scale or y1 - y0 < 40 * self.output.scale:
                     if y1 >= self.output.height - 5:
                         text_pos = (x1, y0)
                     else:
@@ -820,11 +787,8 @@ class Visualizer:
 
                 height_ratio = (y1 - y0) / np.sqrt(self.output.height * self.output.width)
                 lighter_color = self._change_color_brightness(color, brightness_factor=0.7)
-                font_size = (
-                    np.clip((height_ratio - 0.02) / 0.08 + 1, 1.2, 2)
-                    * 0.5
-                    * self._default_font_size
-                )
+                font_size = np.clip((height_ratio - 0.02) / 0.08 + 1, 1.2, 2) * 0.5 * self._default_font_size
+                # HACK: uncomment for drawing label text
                 self.draw_text(
                     labels[i],
                     text_pos,
@@ -1018,9 +982,7 @@ class Visualizer:
         )
         return self.output
 
-    def draw_rotated_box_with_label(
-        self, rotated_box, alpha=0.5, edge_color="g", line_style="-", label=None
-    ):
+    def draw_rotated_box_with_label(self, rotated_box, alpha=0.5, edge_color="g", line_style="-", label=None):
         """
         Draw a rotated box with label on its top-left corner.
         Args:
@@ -1039,9 +1001,7 @@ class Visualizer:
         cnt_x, cnt_y, w, h, angle = rotated_box
         area = w * h
         # use thinner lines when the box is small
-        linewidth = self._default_font_size / (
-            6 if area < _SMALL_OBJECT_AREA_THRESH * self.output.scale else 3
-        )
+        linewidth = self._default_font_size / (6 if area < _SMALL_OBJECT_AREA_THRESH * self.output.scale else 3)
 
         theta = angle * math.pi / 180.0
         c = math.cos(theta)
@@ -1064,9 +1024,7 @@ class Visualizer:
 
             height_ratio = h / np.sqrt(self.output.height * self.output.width)
             label_color = self._change_color_brightness(edge_color, brightness_factor=0.7)
-            font_size = (
-                np.clip((height_ratio - 0.02) / 0.08 + 1, 1.2, 2) * 0.5 * self._default_font_size
-            )
+            font_size = np.clip((height_ratio - 0.02) / 0.08 + 1, 1.2, 2) * 0.5 * self._default_font_size
             self.draw_text(label, text_pos, color=label_color, font_size=font_size, rotation=angle)
 
         return self.output
@@ -1083,9 +1041,7 @@ class Visualizer:
             output (VisImage): image object with box drawn.
         """
         x, y = circle_coord
-        self.output.ax.add_patch(
-            mpl.patches.Circle(circle_coord, radius=radius, fill=True, color=color)
-        )
+        self.output.ax.add_patch(mpl.patches.Circle(circle_coord, radius=radius, fill=True, color=color))
         return self.output
 
     def draw_line(self, x_data, y_data, color, linestyle="-", linewidth=None):
@@ -1118,9 +1074,7 @@ class Visualizer:
         )
         return self.output
 
-    def draw_binary_mask(
-        self, binary_mask, color=None, *, edge_color=None, text=None, alpha=0.5, area_threshold=10
-    ):
+    def draw_binary_mask(self, binary_mask, color=None, *, edge_color=None, text=None, alpha=0.5, area_threshold=10):
         """
         Args:
             binary_mask (ndarray): numpy array of shape (H, W), where H is the image height and

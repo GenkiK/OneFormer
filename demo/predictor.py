@@ -6,10 +6,10 @@
 import atexit
 import bisect
 import multiprocessing as mp
-import torch
 
-from detectron2.data import MetadataCatalog
+import torch
 from defaults import DefaultPredictor
+from detectron2.data import MetadataCatalog
 from visualizer import ColorMode, Visualizer
 
 
@@ -25,8 +25,9 @@ class VisualizationDemo(object):
         self.metadata = MetadataCatalog.get(
             cfg.DATASETS.TEST_PANOPTIC[0] if len(cfg.DATASETS.TEST_PANOPTIC) else "__unused"
         )
-        if 'cityscapes_fine_sem_seg_val' in cfg.DATASETS.TEST_PANOPTIC[0]:
+        if "cityscapes_fine_sem_seg_val" in cfg.DATASETS.TEST_PANOPTIC[0]:
             from cityscapesscripts.helpers.labels import labels
+
             stuff_colors = [k.color for k in labels if k.trainId != 255]
             self.metadata = self.metadata.set(stuff_colors=stuff_colors)
         self.cpu_device = torch.device("cpu")
@@ -52,27 +53,27 @@ class VisualizationDemo(object):
         # Convert image from OpenCV BGR format to Matplotlib RGB format.
         image = image[:, :, ::-1]
         vis_output = {}
-        
-        if task == 'panoptic':
+
+        if task == "panoptic":
             visualizer = Visualizer(image, metadata=self.metadata, instance_mode=ColorMode.IMAGE)
             predictions = self.predictor(image, task)
             panoptic_seg, segments_info = predictions["panoptic_seg"]
-            vis_output['panoptic_inference'] = visualizer.draw_panoptic_seg_predictions(
-            panoptic_seg.to(self.cpu_device), segments_info, alpha=0.7
-        )
+            vis_output["panoptic_inference"] = visualizer.draw_panoptic_seg_predictions(
+                panoptic_seg.to(self.cpu_device), segments_info, alpha=0.7
+            )
 
-        if task == 'panoptic' or task == 'semantic':
+        if task == "panoptic" or task == "semantic":
             visualizer = Visualizer(image, metadata=self.metadata, instance_mode=ColorMode.IMAGE_BW)
             predictions = self.predictor(image, task)
-            vis_output['semantic_inference'] = visualizer.draw_sem_seg(
+            vis_output["semantic_inference"] = visualizer.draw_sem_seg(
                 predictions["sem_seg"].argmax(dim=0).to(self.cpu_device), alpha=0.7
             )
 
-        if task == 'panoptic' or task == 'instance':
+        if task == "panoptic" or task == "instance":
             visualizer = Visualizer(image, metadata=self.metadata, instance_mode=ColorMode.IMAGE_BW)
             predictions = self.predictor(image, task)
             instances = predictions["instances"].to(self.cpu_device)
-            vis_output['instance_inference'] = visualizer.draw_instance_predictions(predictions=instances, alpha=1)
+            vis_output["instance_inference"] = visualizer.draw_instance_predictions(predictions=instances, alpha=0.3)
 
         return predictions, vis_output
 
@@ -119,9 +120,7 @@ class AsyncPredictor:
             cfg = cfg.clone()
             cfg.defrost()
             cfg.MODEL.DEVICE = "cuda:{}".format(gpuid) if num_gpus > 0 else "cpu"
-            self.procs.append(
-                AsyncPredictor._PredictWorker(cfg, self.task_queue, self.result_queue)
-            )
+            self.procs.append(AsyncPredictor._PredictWorker(cfg, self.task_queue, self.result_queue))
 
         self.put_idx = 0
         self.get_idx = 0
